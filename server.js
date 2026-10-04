@@ -7,11 +7,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Store, newId } from './lib/store.js';
 import { fetchPreview } from './lib/preview.js';
-import { CATEGORIES, parsePrice } from './public/shared.js';
+import { classify, jevConfig, splitQuickText } from './lib/classify.js';
+import { DEFAULT_TAGS, TAG_COLORS, nextTagColor, parsePrice } from './public/shared.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const MAX_ITEMS = 1000;
 const MAX_OPTIONS = 30;
+const MAX_TAGS = 50;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -62,16 +64,12 @@ function cleanCurrency(value) {
 }
 
 // Applies the allowed fields from `body` onto `target`. `creating` enforces required fields.
-function applyItemFields(target, body, creating) {
+function applyItemFields(target, body, creating, list) {
   if (creating || 'title' in body) target.title = text(body.title, 200, 'Title', { required: true });
   if (creating || 'notes' in body) target.notes = text(body.notes, 2000, 'Notes');
   if (creating || 'assignee' in body) target.assignee = text(body.assignee, 60, 'Who');
   if (creating || 'date' in body) target.date = cleanDate(body.date);
-  if (creating || 'category' in body) {
-    const category = body.category ?? 'task';
-    if (!(category in CATEGORIES)) throw new HttpError(400, 'Unknown category');
-    target.category = category;
-  }
+  if (creating || 'tags' in body) target.tags = resolveTags(list, body.tags ?? []);
   if ('done' in body) target.done = Boolean(body.done);
   if ('chosenId' in body) {
     const id = body.chosenId || '';
@@ -88,6 +86,54 @@ function applyOptionFields(target, body, creating) {
   if (creating || 'note' in body) target.note = text(body.note, 500, 'Note');
   if (creating || 'price' in body) target.price = cleanPrice(body.price);
   if (!target.url && !target.title) throw new HttpError(400, 'Add a link or a name');
+}
+
+// ---- tags -------------------------------------------------------------------
+
+function findTagByName(list, name) {
+  const wanted = name.trim().toLowerCase();
+  return list.tags.find((t) => t.name.toLowerCase() === wanted);
+}
+
+function addTag(list, { name, color, money }) {
+  const clean = text(name, 40, 'Tag name', { required: true });
+  const existing = findTagByName(list, clean);
+  if (existing) return existing;
+  if (list.tags.length >= MAX_TAGS) throw new HttpError(400, 'Too many tags');
+  const tag = { id: newId(6), name: clean, color: TAG_COLORS.includes(color) ? color : nextTagColor(list.tags), money: 'spend' };
+  if (money) tag.money = cleanMoney(money);
+  list.tags.push(tag);
+  return tag;
+}
+
+function cleanMoney(value) {
+  if (value !== 'spend' && value !== 'income') throw new HttpError(400, 'money must be "spend" or "income"');
+  return value;
+}
+
+// Accepts tag ids, or names (an unknown name creates the tag).
+function resolveTags(list, values) {
+  if (!Array.isArray(values)) throw new HttpError(400, 'tags must be a list');
+  const ids = [];
+  for (const value of values.slice(0, 10)) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const tag = list.tags.find((t) => t.id === value) ?? addTag(list, { name: value });
+    if (!ids.includes(tag.id)) ids.push(tag.id);
+  }
+  return ids;
+}
+
+// Plans created before tags existed had a fixed `category` per item.
+export function migrateList(list) {
+  if (list.tags) return list;
+  list.tags = [];
+  const names = { buy: 'Buy', sell: 'Sell', dispose: 'Throw away' };
+  for (const item of list.items) {
+    const preset = DEFAULT_TAGS.find((t) => t.name === names[item.category]);
+    item.tags = preset ? [addTag(list, preset).id] : [];
+    delete item.category;
+  }
+  return list;
 }
 
 // ---- http helpers ---------------------------------------------------------
@@ -124,6 +170,8 @@ function hasEditKey(list, req) {
 
 const publicList = ({ editKey, ...list }) => list;
 
+const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -140,8 +188,9 @@ export function createServer({
   dataDir = process.env.DATA_DIR || path.join(ROOT, 'data'),
   publicDir = path.join(ROOT, 'public'),
   preview = fetchPreview,
+  classifyItem = classify,
 } = {}) {
-  const store = new Store(dataDir);
+  const store = new Store(dataDir, migrateList);
   const listeners = new Map(); // listId -> Set<res>
 
   function broadcast(list) {
@@ -178,6 +227,7 @@ export function createServer({
     const method = req.method;
     // parts: ['api', 'lists', id, 'items', itemId, 'options', optionId]
     const [, resource, id, sub, itemId, subsub, optionId] = parts;
+    if (resource === 'health') return send(res, 200, { ok: true, smartAdd: jevConfig() ? 'jev' : 'rules' });
     if (resource !== 'lists') throw new HttpError(404, 'Not found');
 
     if (!id) {
@@ -186,6 +236,7 @@ export function createServer({
       const list = await store.create({
         title: text(body.title || 'Our move', 120, 'Title', { required: true }),
         currency: cleanCurrency(body.currency || 'EUR'),
+        tags: DEFAULT_TAGS.map((t) => ({ ...t, id: newId(6) })),
       });
       return send(res, 201, { list: publicList(list), editKey: list.editKey, canEdit: true });
     }
@@ -236,6 +287,80 @@ export function createServer({
       }
     }
 
+    if (sub === 'tags') {
+      const list = await editableList(id, req);
+      const tagId = itemId;
+      if (!tagId) {
+        if (method !== 'POST') throw new HttpError(405, 'Method not allowed');
+        const body = await readJson(req);
+        if (findTagByName(list, String(body.name ?? ''))) throw new HttpError(400, 'That tag already exists');
+        addTag(list, body);
+        return saved(res, list);
+      }
+      const tag = list.tags.find((t) => t.id === tagId);
+      if (!tag) throw new HttpError(404, 'Tag not found');
+      if (method === 'PATCH') {
+        const body = await readJson(req);
+        if ('name' in body) {
+          const name = text(body.name, 40, 'Tag name', { required: true });
+          const clash = findTagByName(list, name);
+          if (clash && clash !== tag) throw new HttpError(400, 'That tag already exists');
+          tag.name = name;
+        }
+        if ('color' in body) {
+          if (!TAG_COLORS.includes(body.color)) throw new HttpError(400, 'Unknown color');
+          tag.color = body.color;
+        }
+        if ('money' in body) tag.money = cleanMoney(body.money);
+        return saved(res, list);
+      }
+      if (method === 'DELETE') {
+        list.tags = list.tags.filter((t) => t !== tag);
+        for (const item of list.items) item.tags = item.tags.filter((t) => t !== tag.id);
+        return saved(res, list);
+      }
+      throw new HttpError(405, 'Method not allowed');
+    }
+
+    if (sub === 'quick') {
+      if (method !== 'POST') throw new HttpError(405, 'Method not allowed');
+      const list = await editableList(id, req);
+      if (list.items.length >= MAX_ITEMS) throw new HttpError(400, 'This plan is full');
+      const body = await readJson(req);
+      const raw = text(body.text, 2200, 'Text', { required: true });
+      cleanDate(body.date); // validate before anything changes
+      const { title, url } = splitQuickText(raw);
+      const link = url ? cleanUrl(url) : '';
+      let page = null;
+      if (link) page = await preview(link).catch(() => null);
+
+      const decision = await classifyItem({ title, url: link, preview: page }, list);
+      const tag = decision.tagId ? list.tags.find((t) => t.id === decision.tagId) : addTag(list, decision.newTag);
+
+      const fallbackTitle = page?.title || (link ? new URL(link).hostname.replace(/^www\./, '') : '');
+      const item = { id: newId(6), done: false, options: [], chosenId: '', createdAt: new Date().toISOString() };
+      applyItemFields(item, { title: capitalize(title || fallbackTitle), date: body.date, tags: [tag.id] }, true, list);
+      if (link) {
+        const option = { id: newId(6) };
+        applyOptionFields(option, {
+          url: link,
+          title: page?.title ?? '',
+          image: page?.image ?? '',
+          siteName: page?.siteName ?? '',
+          price: page?.price ?? null,
+        }, true);
+        item.options.push(option);
+      }
+      list.items.push(item);
+      store.touch(list);
+      broadcast(list);
+      return send(res, 200, {
+        list: publicList(list),
+        canEdit: true,
+        added: { itemId: item.id, tagId: tag.id, newTag: !decision.tagId, confidence: decision.confidence, source: decision.source },
+      });
+    }
+
     if (sub !== 'items') throw new HttpError(404, 'Not found');
     const list = await editableList(id, req);
 
@@ -244,7 +369,7 @@ export function createServer({
       if (list.items.length >= MAX_ITEMS) throw new HttpError(400, 'This plan is full');
       const body = await readJson(req);
       const item = { id: newId(6), done: false, options: [], chosenId: '', createdAt: new Date().toISOString() };
-      applyItemFields(item, body, true);
+      applyItemFields(item, body, true, list);
       list.items.push(item);
       return saved(res, list);
     }
@@ -253,7 +378,7 @@ export function createServer({
 
     if (!subsub) {
       if (method === 'PATCH') {
-        applyItemFields(item, await readJson(req), false);
+        applyItemFields(item, await readJson(req), false, list);
         return saved(res, list);
       }
       if (method === 'DELETE') {

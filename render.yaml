@@ -1,0 +1,17 @@
+# One-click deploy on Render: Dashboard → New → Blueprint → pick this repo.
+# A persistent disk keeps plans across restarts and deploys (needs a paid instance).
+services:
+  - type: web
+    name: plantogether
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: JEV_API_KEY # TypeSafe key for smart quick add (optional)
+        sync: false
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1

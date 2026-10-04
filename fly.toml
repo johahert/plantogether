@@ -1,0 +1,29 @@
+# Deploy on Fly.io:
+#   fly launch --copy-config --no-deploy
+#   fly volumes create data --size 1
+#   fly secrets set JEV_API_KEY=...   (optional, for smart quick add)
+#   fly deploy --ha=false   (one machine: plans are files on its volume)
+app = "plantogether"
+primary_region = "arn"
+
+[build]
+
+[env]
+  DATA_DIR = "/data"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/api/health"
+    interval = "30s"
+    timeout = "5s"

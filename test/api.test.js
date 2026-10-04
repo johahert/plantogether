@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createServer } from '../server.js';
+import { classify } from '../lib/classify.js';
+import { createServer, migrateList } from '../server.js';
 
 let server;
 let base;
@@ -14,6 +15,8 @@ before(async () => {
   server = createServer({
     dataDir,
     preview: async (url) => ({ title: `Preview of ${url}`, image: '', siteName: 'shop.test', price: 999, currency: 'SEK' }),
+    // No JEV key in tests: quick add uses the keyword rules.
+    classifyItem: (input, list) => classify(input, list, { config: null }),
   });
   await new Promise((resolve) => server.listen(0, resolve));
   base = `http://localhost:${server.address().port}`;
@@ -41,6 +44,8 @@ test('full planning flow: items, dates, choices, permissions', async () => {
   assert.equal(list.editKey, undefined, 'edit key is never part of the list payload');
   const key = editKey;
   const id = list.id;
+  assert.deepEqual(list.tags.map((t) => [t.name, t.money]), [['Buy', 'spend'], ['Sell', 'income'], ['Throw away', 'spend']]);
+  const tagId = (l, name) => l.tags.find((t) => t.name === name).id;
 
   // View-only access can read but not write.
   const viewed = await call('GET', `/api/lists/${id}`);
@@ -49,11 +54,14 @@ test('full planning flow: items, dates, choices, permissions', async () => {
   assert.equal((await call('POST', `/api/lists/${id}/items`, { body: { title: 'x' }, key: 'wrong' })).status, 403);
 
   // Day- and month-scoped items.
-  let r = await call('POST', `/api/lists/${id}/items`, { key, body: { title: 'Sell bookcase', category: 'sell', date: '2026-10-12' } });
+  let r = await call('POST', `/api/lists/${id}/items`, { key, body: { title: 'Sell bookcase', tags: [tagId(list, 'Sell')], date: '2026-10-12' } });
   assert.equal(r.status, 200);
-  r = await call('POST', `/api/lists/${id}/items`, { key, body: { title: 'New sofa', category: 'buy', date: '2026-11' } });
+  // Tags can be given by name; unknown names create the tag.
+  r = await call('POST', `/api/lists/${id}/items`, { key, body: { title: 'New sofa', tags: ['buy', 'Living room'], date: '2026-11' } });
   const sofa = r.data.list.items.at(-1);
   assert.equal(sofa.date, '2026-11');
+  assert.deepEqual(sofa.tags, [tagId(r.data.list, 'Buy'), tagId(r.data.list, 'Living room')]);
+  assert.equal(r.data.list.tags.length, 4);
   assert.equal((await call('POST', `/api/lists/${id}/items`, { key, body: { title: 'Bad', date: '12/10' } })).status, 400);
   assert.equal((await call('POST', `/api/lists/${id}/items`, { key, body: { title: '  ' } })).status, 400);
 
@@ -129,4 +137,74 @@ test('live updates are pushed over SSE', async () => {
   await call('POST', `/api/lists/${data.list.id}/items`, { key: data.editKey, body: { title: 'Hello' } });
   await waitFor(/"version":2/);
   controller.abort();
+});
+
+test('tags: create, rename, recolor, switch to income, delete', async () => {
+  const { data } = await call('POST', '/api/lists', { body: { title: 'Tags', currency: 'EUR' } });
+  const key = data.editKey;
+  const base = `/api/lists/${data.list.id}`;
+  let r = await call('POST', `${base}/tags`, { key, body: { name: 'Kitchen' } });
+  const kitchen = r.data.list.tags.find((t) => t.name === 'Kitchen');
+  assert.equal(kitchen.money, 'spend');
+  assert.equal((await call('POST', `${base}/tags`, { key, body: { name: 'kitchen' } })).status, 400, 'duplicate names');
+  assert.equal((await call('POST', `${base}/tags`, { body: { name: 'X' } })).status, 403);
+
+  r = await call('PATCH', `${base}/tags/${kitchen.id}`, { key, body: { name: 'Köket', color: 'pink', money: 'income' } });
+  assert.deepEqual(r.data.list.tags.find((t) => t.id === kitchen.id), { ...kitchen, name: 'Köket', color: 'pink', money: 'income' });
+  assert.equal((await call('PATCH', `${base}/tags/${kitchen.id}`, { key, body: { color: 'rainbow' } })).status, 400);
+  assert.equal((await call('PATCH', `${base}/tags/${kitchen.id}`, { key, body: { name: 'Buy' } })).status, 400);
+
+  r = await call('POST', `${base}/items`, { key, body: { title: 'Toaster', tags: [kitchen.id] } });
+  r = await call('DELETE', `${base}/tags/${kitchen.id}`, { key });
+  assert.ok(!r.data.list.tags.some((t) => t.id === kitchen.id));
+  assert.deepEqual(r.data.list.items[0].tags, []);
+});
+
+test('smart quick add files items under existing or new tags', async () => {
+  const { data } = await call('POST', '/api/lists', { body: { title: 'Quick', currency: 'SEK' } });
+  const key = data.editKey;
+  const url = `/api/lists/${data.list.id}/quick`;
+
+  let r = await call('POST', url, { key, body: { text: 'sälj gamla bokhyllan' } });
+  assert.equal(r.status, 200);
+  let item = r.data.list.items.at(-1);
+  assert.equal(item.title, 'Sälj gamla bokhyllan');
+  assert.equal(r.data.list.tags.find((t) => t.id === r.data.added.tagId).name, 'Sell');
+  assert.equal(r.data.added.newTag, false);
+  assert.equal(r.data.added.source, 'rules');
+
+  // A bare product link: titled from the page, price from the preview, filed under Buy.
+  r = await call('POST', url, { key, body: { text: 'https://shop.test/sofa' } });
+  item = r.data.list.items.at(-1);
+  assert.equal(item.title, 'Preview of https://shop.test/sofa');
+  assert.equal(item.options[0].price, 999);
+  assert.equal(r.data.list.tags.find((t) => t.id === item.tags[0]).name, 'Buy');
+
+  // Something no existing tag covers creates a suggested one.
+  r = await call('POST', url, { key, body: { text: 'Donate the kids clothes', date: '2026-11' } });
+  assert.equal(r.data.added.newTag, true);
+  assert.equal(r.data.list.tags.at(-1).name, 'Donate');
+  assert.equal(r.data.list.items.at(-1).date, '2026-11');
+
+  assert.equal((await call('POST', url, { key, body: { text: '   ' } })).status, 400);
+  assert.equal((await call('POST', url, { body: { text: 'sell x' } })).status, 403);
+});
+
+test('old plans with fixed categories are migrated to tags', () => {
+  const list = migrateList({
+    items: [
+      { id: 'a', title: 'Sofa', category: 'buy', options: [] },
+      { id: 'b', title: 'Lamp', category: 'sell', options: [] },
+      { id: 'c', title: 'Call movers', category: 'task', options: [] },
+    ],
+  });
+  assert.deepEqual(list.tags.map((t) => [t.name, t.money]), [['Buy', 'spend'], ['Sell', 'income']]);
+  assert.deepEqual(list.items.map((i) => i.tags.length), [1, 1, 0]);
+  assert.ok(list.items.every((i) => !('category' in i)));
+});
+
+test('health check', async () => {
+  const r = await call('GET', '/api/health');
+  assert.equal(r.status, 200);
+  assert.equal(r.data.ok, true);
 });

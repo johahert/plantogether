@@ -1,11 +1,19 @@
 // Logic shared by the browser and the server (plain ES module, no deps).
 
-export const CATEGORIES = {
-  buy: 'Buy',
-  sell: 'Sell',
-  dispose: 'Throw away',
-  task: 'Task',
-};
+export const TAG_COLORS = ['blue', 'green', 'amber', 'purple', 'red', 'teal', 'pink', 'slate'];
+
+// A tag's `money` decides how prices on its items count:
+// 'spend' adds to what you'll pay, 'income' to what sales bring in.
+export const DEFAULT_TAGS = [
+  { name: 'Buy', color: 'blue', money: 'spend' },
+  { name: 'Sell', color: 'green', money: 'income' },
+  { name: 'Throw away', color: 'amber', money: 'spend' },
+];
+
+export function nextTagColor(tags) {
+  const used = new Set(tags.map((t) => t.color));
+  return TAG_COLORS.find((c) => !used.has(c)) ?? TAG_COLORS[tags.length % TAG_COLORS.length];
+}
 
 // Turns "1 299,00 kr", "1,299.00", "12.50", 1299 into a number.
 // Returns null for empty input and NaN for garbage.
@@ -59,11 +67,15 @@ export function itemCost(item) {
   };
 }
 
-export function totals(items) {
+export function isIncome(item, tags) {
+  return (item.tags || []).some((id) => tags.find((t) => t.id === id)?.money === 'income');
+}
+
+export function totals(items, tags = []) {
   const t = { spend: 0, income: 0, undecided: 0, minExtra: 0, maxExtra: 0 };
   for (const item of items) {
     const cost = itemCost(item);
-    if (item.category === 'sell') {
+    if (isIncome(item, tags)) {
       t.income += cost.amount;
       continue;
     }

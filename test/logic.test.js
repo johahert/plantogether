@@ -23,9 +23,10 @@ test('parsePrice handles common price formats', () => {
   assert.ok(Number.isNaN(parsePrice('1.2.3')));
 });
 
-test('choices only count once decided; sales are income', () => {
+test('choices only count once decided; income tags are income', () => {
+  const tags = [{ id: 'buy', money: 'spend' }, { id: 'sell', money: 'income' }];
   const sofa = {
-    category: 'buy',
+    tags: ['buy'],
     chosenId: '',
     options: [
       { id: 'a', price: 4000 },
@@ -35,14 +36,14 @@ test('choices only count once decided; sales are income', () => {
   assert.deepEqual(itemCost(sofa), { amount: 0, decided: false, min: 4000, max: 6000 });
   const items = [
     sofa,
-    { category: 'buy', options: [{ id: 'c', price: 300 }] },
-    { category: 'sell', options: [{ id: 'd', price: 1500 }] },
-    { category: 'task', options: [] },
+    { tags: ['buy'], options: [{ id: 'c', price: 300 }] },
+    { tags: ['sell'], options: [{ id: 'd', price: 1500 }] },
+    { tags: [], options: [{ id: 'e', price: 50 }] },
   ];
-  assert.deepEqual(totals(items), { spend: 300, income: 1500, undecided: 1, minExtra: 4000, maxExtra: 6000 });
+  assert.deepEqual(totals(items, tags), { spend: 350, income: 1500, undecided: 1, minExtra: 4000, maxExtra: 6000 });
   sofa.chosenId = 'b';
-  assert.equal(totals(items).spend, 6300);
-  assert.equal(totals(items).undecided, 0);
+  assert.equal(totals(items, tags).spend, 6350);
+  assert.equal(totals(items, tags).undecided, 0);
 });
 
 test('parseMeta reads OpenGraph product tags', () => {

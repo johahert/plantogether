@@ -1,4 +1,4 @@
-import { CATEGORIES, itemCost, totals } from './shared.js';
+import { TAG_COLORS, itemCost, isIncome, totals } from './shared.js';
 
 const app = document.getElementById('app');
 const sheet = document.getElementById('sheet');
@@ -30,9 +30,10 @@ const state = {
   list: null,
   canEdit: false,
   key: '',
-  filter: 'all',
+  filter: 'all', // 'all' | 'decide' | a tag id
   hideDone: local.get(HIDE_DONE, false),
   events: null,
+  quickBusy: false,
 };
 
 // ---- helpers --------------------------------------------------------------
@@ -85,11 +86,15 @@ function guessCurrency() {
 }
 
 let toastTimer;
-function toast(message, isError = false) {
-  toastEl.textContent = message;
-  toastEl.className = `show${isError ? ' error' : ''}`;
+function toast(message, { error = false, action } = {}) {
+  toastEl.innerHTML = `<span>${esc(message)}</span>${action ? `<button type="button">${esc(action.label)}</button>` : ''}`;
+  if (action) toastEl.querySelector('button').onclick = () => {
+    toastEl.className = '';
+    action.run();
+  };
+  toastEl.className = `show${error ? ' error' : ''}${action ? ' has-action' : ''}`;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (toastEl.className = ''), isError ? 4500 : 2200);
+  toastTimer = setTimeout(() => (toastEl.className = ''), error || action ? 5000 : 2200);
 }
 
 async function api(path, { method = 'GET', body } = {}) {
@@ -105,21 +110,29 @@ function applyList(data) {
   if (state.list && data.list.version < state.list.version) return;
   state.list = data.list;
   state.canEdit = data.canEdit;
+  if (state.filter !== 'all' && state.filter !== 'decide' && !tagById(state.filter)) state.filter = 'all';
   remember();
   renderList();
 }
 
 async function mutate(path, method, body) {
   try {
-    applyList(await api(`/lists/${state.list.id}${path}`, { method, body }));
-    return true;
+    const data = await api(`/lists/${state.list.id}${path}`, { method, body });
+    applyList(data);
+    return data;
   } catch (err) {
-    toast(err.message, true);
+    toast(err.message, { error: true });
     return false;
   }
 }
 
 const findItem = (id) => state.list.items.find((i) => i.id === id);
+const tagById = (id) => state.list.tags.find((t) => t.id === id);
+const colorOf = (tag) => (TAG_COLORS.includes(tag?.color) ? tag.color : 'slate');
+
+function tagPill(tag, extra = '') {
+  return `<span class="tag" data-color="${colorOf(tag)}" ${extra}>${esc(tag.name)}</span>`;
+}
 
 function remember() {
   const { id, title } = state.list;
@@ -135,12 +148,14 @@ const viewUrl = () => `${location.origin}/l/${state.list.id}`;
 
 function renderHome() {
   document.title = 'PlanTogether';
+  document.body.classList.remove('has-composer');
   const recent = local.get(RECENT, []);
   const keys = local.get(KEYS, {});
   const currency = guessCurrency();
   app.innerHTML = `
     <div class="wrap">
       <section class="hero">
+        <img src="/icon.svg" alt="" width="56" height="56">
         <h1>PlanTogether</h1>
         <p>Plan a move together: what to sell, throw away and buy, when to do it, and what it all costs.</p>
       </section>
@@ -150,15 +165,15 @@ function renderHome() {
           <input name="title" required maxlength="120" placeholder="Our move to …"></label>
         <label class="field"><span>Currency</span>
           <select name="currency">${CURRENCIES.map((c) => `<option ${c === currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
-        <button class="btn primary">Create plan</button>
+        <button class="btn primary block">Create plan</button>
       </form>
       ${
         recent.length
           ? `<section class="card"><h2>Your plans on this device</h2><ul class="recent">${recent
               .map(
                 (r) => `<li>
-                  <a href="/l/${esc(r.id)}${keys[r.id] ? `#key=${esc(keys[r.id])}` : ''}">${esc(r.title)}
-                    ${r.edit ? '' : '<small>· view only</small>'}</a>
+                  <a href="/l/${esc(r.id)}${keys[r.id] ? `#key=${esc(keys[r.id])}` : ''}">
+                    <span>${esc(r.title)}</span>${r.edit ? '' : '<small>View only</small>'}</a>
                   <button class="icon-btn" data-action="forget" data-id="${esc(r.id)}" aria-label="Remove from this list">✕</button>
                 </li>`,
               )
@@ -176,7 +191,7 @@ function renderHome() {
       local.set(KEYS, { ...local.get(KEYS, {}), [data.list.id]: data.editKey });
       location.href = `/l/${data.list.id}#key=${data.editKey}`;
     } catch (err) {
-      toast(err.message, true);
+      toast(err.message, { error: true });
       form.querySelector('button').disabled = false;
     }
   });
@@ -194,9 +209,7 @@ async function openList(id) {
   try {
     applyList(await api(`/lists/${id}`));
   } catch (err) {
-    if (err.status === 404) {
-      local.set(RECENT, local.get(RECENT, []).filter((r) => r.id !== id));
-    }
+    if (err.status === 404) local.set(RECENT, local.get(RECENT, []).filter((r) => r.id !== id));
     app.innerHTML = `<div class="wrap"><p class="empty">${esc(err.message)}<br><br><a href="/">Go to start</a></p></div>`;
     return;
   }
@@ -222,66 +235,125 @@ function refresh() {
   return refreshing;
 }
 
-const FILTERS = [
-  ['all', 'All'],
-  ...Object.entries(CATEGORIES),
-  ['decide', 'To decide'],
-];
-
 function matchesFilter(item) {
   if (state.hideDone && item.done) return false;
   if (state.filter === 'all') return true;
   if (state.filter === 'decide') return item.options.length > 1 && !item.chosenId;
-  return item.category === state.filter;
+  return item.tags.includes(state.filter);
 }
 
 function renderList() {
   const { list, canEdit } = state;
   document.title = `${list.title} · PlanTogether`;
-  const t = totals(list.items);
+  document.body.classList.toggle('has-composer', canEdit);
+  const t = totals(list.items, list.tags);
   const doneCount = list.items.filter((i) => i.done).length;
   const pct = list.items.length ? Math.round((doneCount / list.items.length) * 100) : 0;
+  const undecided = list.items.filter((i) => i.options.length > 1 && !i.chosenId).length;
+
+  // Keep whatever someone is typing in the quick-add box across re-renders.
+  const draft = document.getElementById('quick-input')?.value ?? '';
+  const hadFocus = document.activeElement?.id === 'quick-input';
+  const scrollX = document.querySelector('.filters')?.scrollLeft ?? 0;
+
+  const chip = (value, label, pressed, extra = '') =>
+    `<button class="chip" data-action="filter" data-value="${value}" aria-pressed="${pressed}" ${extra}>${label}</button>`;
 
   app.innerHTML = `
     <header class="top"><div class="wrap">
-      <a class="home" href="/" aria-label="All plans">‹</a>
+      <a class="icon-btn back" href="/" aria-label="All plans">‹</a>
       <h1>${esc(list.title)}</h1>
-      <button class="btn" data-action="share">Share</button>
-      ${canEdit ? '<button class="icon-btn" data-action="settings" aria-label="Plan settings">⚙︎</button>' : ''}
+      <button class="icon-btn" data-action="share" aria-label="Share">${ICON_SHARE}</button>
+      ${canEdit ? `<button class="icon-btn" data-action="settings" aria-label="Plan settings and tags">${ICON_GEAR}</button>` : ''}
     </div></header>
     ${canEdit ? '' : '<div class="readonly-banner">View only. Ask for the edit link to make changes.</div>'}
     <main class="wrap">
       <section class="summary">
-        <div><small>To spend</small><strong>${money(t.spend)}</strong></div>
-        <div><small>From sales</small><strong>${money(t.income)}</strong></div>
-        <div><small>Net cost</small><strong>${money(t.spend - t.income)}</strong></div>
+        <div class="stats">
+          <div><small>To spend</small><strong>${money(t.spend)}</strong></div>
+          <div><small>From sales</small><strong>${money(t.income)}</strong></div>
+          <div><small>Net cost</small><strong>${money(t.spend - t.income)}</strong></div>
+        </div>
         ${
           t.undecided
-            ? `<div class="note">+ ${t.undecided} undecided choice${t.undecided > 1 ? 's' : ''}: ${money(t.minExtra)} – ${money(t.maxExtra)} more</div>`
+            ? `<p class="summary-note">+ ${t.undecided} undecided choice${t.undecided > 1 ? 's' : ''}: ${money(t.minExtra)} – ${money(t.maxExtra)} more</p>`
             : ''
         }
-        <div class="note">${doneCount} of ${list.items.length} done</div>
-        <div class="progress"><span style="width:${pct}%"></span></div>
+        <div class="progress-row">
+          <div class="progress"><span style="width:${pct}%"></span></div>
+          <small>${doneCount}/${list.items.length} done</small>
+        </div>
       </section>
-      <nav class="filters">
-        ${FILTERS.map(
-          ([value, label]) =>
-            `<button class="chip" data-action="filter" data-value="${value}" aria-pressed="${state.filter === value}">${label}</button>`,
-        ).join('')}
-        <button class="chip" data-action="hide-done" aria-pressed="${state.hideDone}">Hide done</button>
+      <nav class="filters" aria-label="Filter">
+        ${chip('all', 'All', state.filter === 'all')}
+        ${list.tags.map((tag) => chip(tag.id, `<i data-color="${colorOf(tag)}"></i>${esc(tag.name)}`, state.filter === tag.id)).join('')}
+        ${undecided ? chip('decide', `To decide · ${undecided}`, state.filter === 'decide') : ''}
+        <button class="chip" data-action="hide-done" aria-pressed="${state.hideDone}">${state.hideDone ? 'Show done' : 'Hide done'}</button>
       </nav>
       ${timeline(list.items.filter(matchesFilter))}
     </main>
-    ${canEdit ? '<button class="fab" data-action="add-item">+ Add</button>' : ''}`;
+    ${
+      canEdit
+        ? `<form class="composer" id="quick-form" autocomplete="off">
+            <button type="button" class="icon-btn" data-action="add-item" aria-label="Add with details">＋</button>
+            <input id="quick-input" name="text" enterkeyhint="send" maxlength="2200"
+              placeholder="Quick add: “sell bookcase” or paste a link" ${state.quickBusy ? 'disabled' : ''}>
+            <button class="send" aria-label="Smart add" ${state.quickBusy ? 'disabled' : ''}>${state.quickBusy ? '<span class="spinner"></span>' : '✨'}</button>
+          </form>`
+        : ''
+    }`;
+
+  const quick = document.getElementById('quick-input');
+  if (quick) {
+    quick.value = draft;
+    if (hadFocus) quick.focus();
+    document.getElementById('quick-form').addEventListener('submit', quickAdd);
+  }
+  const filters = document.querySelector('.filters');
+  if (filters) filters.scrollLeft = scrollX;
+}
+
+async function quickAdd(e) {
+  e.preventDefault();
+  const input = document.getElementById('quick-input');
+  const text = input.value.trim();
+  if (!text || state.quickBusy) return;
+  state.quickBusy = true;
+  renderList();
+  let data;
+  try {
+    data = await api(`/lists/${state.list.id}/quick`, { method: 'POST', body: { text } });
+  } catch (err) {
+    toast(err.message, { error: true });
+  }
+  state.quickBusy = false;
+  if (data) document.getElementById('quick-input').value = '';
+  if (!data) return renderList();
+  if (state.filter !== 'all' && state.filter !== 'decide' && state.filter !== data.added.tagId) state.filter = 'all';
+  applyList(data);
+
+  const { itemId, tagId, newTag } = data.added;
+  const tag = tagById(tagId);
+  toast(`${newTag ? 'New tag' : 'Added to'} “${tag?.name}”`, {
+    action: { label: 'Edit', run: () => openItemForm(findItem(itemId)) },
+  });
+  const card = document.querySelector(`[data-id="${itemId}"]`);
+  card?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  card?.classList.add('flash');
 }
 
 function timeline(items) {
   if (!state.list.items.length) {
-    return `<p class="empty">Nothing here yet.<br>${
-      state.canEdit
-        ? 'Tap <b>+ Add</b> to add things to sell, throw away or buy. Give them a day or just a month.'
-        : ''
-    }</p>`;
+    return `<div class="empty">
+      <p><strong>Nothing here yet.</strong></p>
+      ${
+        state.canEdit
+          ? `<p>Type something below, like “sell the old bookcase” or “throw away broken chair”, or paste a link to a sofa you like.
+             ✨ files it under the right tag for you.</p>
+             <p>Use <b>＋</b> to add one with a date, a person and notes.</p>`
+          : ''
+      }
+    </div>`;
   }
   if (!items.length) return '<p class="empty">Nothing matches this filter.</p>';
 
@@ -312,7 +384,8 @@ function timeline(items) {
   for (const key of [...months.keys()].sort()) {
     const { whole, days } = months.get(key);
     const total = whole.length + [...days.values()].reduce((n, d) => n + d.length, 0);
-    html += `<section class="month"><h2>${esc(monthName(key))}${key === thisMonth ? ' <small>this month</small>' : ''}<small>${count(total)}</small></h2>`;
+    html += `<section class="month">
+      <h2>${esc(monthName(key))}${key === thisMonth ? '<span class="now">This month</span>' : ''}<small>${count(total)}</small></h2>`;
     if (whole.length) html += `<div class="day-label">Any time this month</div>${cards(whole)}`;
     for (const day of [...days.keys()].sort()) {
       const cls = day === today ? 'today' : day < today ? 'past' : '';
@@ -321,42 +394,43 @@ function timeline(items) {
     html += '</section>';
   }
   if (undated.length) {
-    html += `<section class="month"><h2>No date yet <small>${count(undated.length)}</small></h2>${cards(undated)}</section>`;
+    html += `<section class="month"><h2>No date yet<small>${count(undated.length)}</small></h2>${cards(undated)}</section>`;
   }
   return html;
 }
 
 function itemCard(item, today) {
-  const { canEdit } = state;
+  const { canEdit, list } = state;
   const cost = itemCost(item);
+  const income = isIncome(item, list.tags);
+  const tags = item.tags.map(tagById).filter(Boolean);
   const overdue =
     !item.done && item.date && (item.date.length === 7 ? item.date < today.slice(0, 7) : item.date < today);
 
   let costHtml = '';
   if (!cost.decided) {
-    costHtml = `<span class="cost undecided">Not decided · ${money(cost.min)} – ${money(cost.max)}</span>`;
+    costHtml = `<span class="cost undecided">${money(cost.min)} – ${money(cost.max)}</span>`;
   } else if (cost.amount) {
-    costHtml = `<span class="cost ${item.category === 'sell' ? 'income' : ''}">${item.category === 'sell' ? '+' : ''}${money(cost.amount)}</span>`;
+    costHtml = `<span class="cost ${income ? 'income' : ''}">${income ? '+' : ''}${money(cost.amount)}</span>`;
   }
-
-  const addLabel = item.options.length
-    ? '+ Add alternative'
-    : item.category === 'sell'
-      ? '+ Add listing / price'
-      : '+ Add link / price';
+  const addLabel = item.options.length ? '+ Alternative' : income ? '+ Listing' : '+ Link';
 
   return `
-    <article class="item cat-${item.category} ${item.done ? 'done' : ''}">
-      <div class="item-head">
+    <article class="item ${item.done ? 'done' : ''}" data-id="${item.id}" data-color="${colorOf(tags[0])}">
+      <div class="item-row">
         <button class="check" data-action="toggle-done" data-item="${item.id}" aria-pressed="${item.done}"
-          aria-label="Mark done" ${canEdit ? '' : 'disabled'}>✓</button>
+          aria-label="${item.done ? 'Mark not done' : 'Mark done'}" ${canEdit ? '' : 'disabled'}>${ICON_CHECK}</button>
         <div class="item-main">
           <h3>${esc(item.title)}</h3>
-          <div class="meta">
-            <span class="badge">${CATEGORIES[item.category]}</span>
-            ${item.date ? `<span class="${overdue ? 'overdue' : ''}">📅 ${esc(whenLabel(item.date))}</span>` : ''}
-            ${item.assignee ? `<span>👤 ${esc(item.assignee)}</span>` : ''}
-          </div>
+          ${tags.length ? `<div class="tags">${tags.map((t) => tagPill(t)).join('')}</div>` : ''}
+          ${
+            item.date || item.assignee
+              ? `<div class="meta">
+                  ${item.date ? `<span class="${overdue ? 'overdue' : ''}">📅 ${esc(whenLabel(item.date))}</span>` : ''}
+                  ${item.assignee ? `<span>👤 ${esc(item.assignee)}</span>` : ''}
+                </div>`
+              : ''
+          }
           ${item.notes ? `<p class="notes">${esc(item.notes)}</p>` : ''}
         </div>
         ${canEdit ? `<button class="icon-btn" data-action="edit-item" data-item="${item.id}" aria-label="Edit">⋯</button>` : ''}
@@ -378,9 +452,7 @@ function optionsHtml(item) {
   const choice = options.length > 1;
   const cards = options.map((o) => optionCard(item, o, choice)).join('');
   if (!choice) return `<div class="options single">${cards}</div>`;
-  const hint = item.chosenId
-    ? 'Chosen. Only this one counts toward the total.'
-    : `Pick one of ${options.length}. It will be added to the total.`;
+  const hint = item.chosenId ? 'Chosen. Only this one counts toward the total.' : `Pick one of ${options.length}`;
   return `<div class="options choice"><p class="choose-hint">${hint}</p><div class="grid">${cards}</div></div>`;
 }
 
@@ -402,8 +474,8 @@ function optionCard(item, o, choice) {
         <span class="opt-price">${o.price != null ? money(o.price) : '<small>No price</small>'}</span>
         ${
           choice && state.canEdit
-            ? `<div class="opt-actions"><button class="btn small ${chosen ? 'primary' : ''}" data-action="choose"
-                data-item="${item.id}" data-opt="${o.id}">${chosen ? '✓ Chosen' : 'Choose'}</button></div>`
+            ? `<button class="btn small block ${chosen ? 'primary' : ''}" data-action="choose"
+                data-item="${item.id}" data-opt="${o.id}">${chosen ? '✓ Chosen' : 'Choose'}</button>`
             : ''
         }
       </div>
@@ -418,7 +490,7 @@ function optionCard(item, o, choice) {
 // ---- bottom sheet forms ---------------------------------------------------
 
 function openSheet(html, onSubmit) {
-  sheet.innerHTML = `<form class="sheet-body" novalidate>${html}</form>`;
+  sheet.innerHTML = `<form class="sheet-body" novalidate><div class="grabber"></div>${html}</form>`;
   const form = sheet.querySelector('form');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -445,11 +517,56 @@ const sheetActions = (deleteAction, attrs = '') => `
     <button class="btn primary">Save</button>
   </div>`;
 
+function tagPicker(selectedIds) {
+  return `<div class="field"><span>Tags</span>
+    <div class="tag-picker">
+      ${state.list.tags
+        .map(
+          (tag) => `<label class="tag-toggle">
+            <input type="checkbox" name="tag" value="${tag.id}" ${selectedIds.includes(tag.id) ? 'checked' : ''}>
+            ${tagPill(tag)}</label>`,
+        )
+        .join('')}
+      <span class="new-tag">
+        <input type="text" maxlength="40" placeholder="+ New tag" aria-label="New tag" enterkeyhint="done">
+      </span>
+    </div></div>`;
+}
+
+// Typing a new tag name and pressing enter adds a selected chip (created on save).
+function wireTagPicker(form) {
+  const input = form.querySelector('.new-tag input');
+  const addChip = () => {
+    const name = input.value.trim();
+    if (!name) return;
+    input.value = '';
+    const existing = [...form.querySelectorAll('input[name=tag]')].find(
+      (el) => (tagById(el.value)?.name ?? el.value).toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) {
+      existing.checked = true;
+      return;
+    }
+    const label = document.createElement('label');
+    label.className = 'tag-toggle';
+    label.innerHTML = `<input type="checkbox" name="tag" value="${esc(name)}" checked>${tagPill({ name, color: 'slate' })}`;
+    input.parentElement.before(label);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addChip();
+    }
+  });
+  input.addEventListener('blur', addChip);
+}
+
 function openItemForm(item) {
+  if (!state.canEdit) return;
   const isNew = !item;
   const v = item || {
     title: '',
-    category: state.filter in CATEGORIES ? state.filter : 'task',
+    tags: tagById(state.filter) ? [state.filter] : [],
     date: '',
     assignee: '',
     notes: '',
@@ -464,13 +581,11 @@ function openItemForm(item) {
     <h2>${isNew ? 'New item' : 'Edit item'}</h2>
     <label class="field"><span>What</span>
       <input name="title" required maxlength="200" value="${esc(v.title)}" placeholder="e.g. Sell the old bookcase"></label>
-    <div class="field"><span>Type</span><div class="seg">
-      ${Object.entries(CATEGORIES).map(([k, label]) => radio('category', k, label, k === v.category)).join('')}
-    </div></div>
+    ${tagPicker(v.tags)}
     <div class="field"><span>When</span><div class="seg">
       ${radio('when', 'none', 'No date', mode === 'none')}
       ${radio('when', 'day', 'A day', mode === 'day')}
-      ${radio('when', 'month', 'Sometime in a month', mode === 'month')}
+      ${radio('when', 'month', 'A month', mode === 'month')}
     </div></div>
     <label class="field" data-when="day"><span>Day</span>
       <input type="date" name="day" value="${mode === 'day' ? v.date : ''}"></label>
@@ -482,17 +597,20 @@ function openItemForm(item) {
     <label class="field"><span>Notes</span>
       <textarea name="notes" maxlength="2000" placeholder="Optional">${esc(v.notes)}</textarea></label>
     ${sheetActions(isNew ? '' : 'delete-item', `data-item="${item?.id}"`)}`,
-    async (data) => {
+    async (data, form) => {
+      form.querySelector('.new-tag input').dispatchEvent(new Event('blur'));
       const date = data.when === 'day' ? data.day : data.when === 'month' ? data.month : '';
       if (data.when !== 'none' && !date) {
-        toast(data.when === 'day' ? 'Pick a day' : 'Pick a month', true);
+        toast(data.when === 'day' ? 'Pick a day' : 'Pick a month', { error: true });
         return false;
       }
-      const body = { title: data.title, category: data.category, date, assignee: data.assignee, notes: data.notes };
+      const tags = [...form.querySelectorAll('input[name=tag]:checked')].map((el) => el.value);
+      const body = { title: data.title, tags, date, assignee: data.assignee, notes: data.notes };
       return isNew ? mutate('/items', 'POST', body) : mutate(`/items/${item.id}`, 'PATCH', body);
     },
   );
 
+  wireTagPicker(form);
   const syncWhen = () => {
     const when = form.elements.when.value;
     for (const el of form.querySelectorAll('[data-when]')) el.hidden = el.dataset.when !== when;
@@ -511,7 +629,7 @@ function openOptionForm(item, option) {
     `
     <h2>${heading}</h2>
     <p class="hint">For “${esc(item.title)}”. Add two or more to make it a choice: pick one and only that price counts.</p>
-    <div class="field"><span>Link</span><div class="share-row">
+    <div class="field"><span>Link</span><div class="input-row">
       <input name="url" type="url" inputmode="url" autocomplete="off" placeholder="Paste a link: https://…" value="${esc(v.url)}">
       <button type="button" class="btn small" data-action="fetch-preview">Fetch</button>
     </div></div>
@@ -569,7 +687,7 @@ async function fetchPreviewInto(form, force = false) {
 }
 
 function shareRow(label, url) {
-  return `<div class="field"><span>${label}</span><div class="share-row">
+  return `<div class="field"><span>${label}</span><div class="input-row">
     <input readonly value="${esc(url)}" onfocus="this.select()">
     <button type="button" class="btn small" data-action="copy" data-value="${esc(url)}">Copy</button>
   </div></div>`;
@@ -592,18 +710,66 @@ function openShare() {
   );
 }
 
+function tagRows() {
+  return state.list.tags
+    .map(
+      (tag) => `<div class="tag-row" data-tag="${tag.id}">
+        <button type="button" class="swatch" data-action="cycle-color" data-tag="${tag.id}" data-color="${colorOf(tag)}"
+          aria-label="Change colour"></button>
+        <input class="tag-name" value="${esc(tag.name)}" maxlength="40" aria-label="Tag name" data-tag="${tag.id}">
+        <select class="tag-money" data-tag="${tag.id}" aria-label="How prices count">
+          <option value="spend" ${tag.money === 'spend' ? 'selected' : ''}>Costs</option>
+          <option value="income" ${tag.money === 'income' ? 'selected' : ''}>Income</option>
+        </select>
+        <button type="button" class="icon-btn" data-action="delete-tag" data-tag="${tag.id}" aria-label="Delete tag">✕</button>
+      </div>`,
+    )
+    .join('');
+}
+
 function openSettings() {
   const { title, currency } = state.list;
   const options = CURRENCIES.includes(currency) ? CURRENCIES : [currency, ...CURRENCIES];
-  openSheet(
+  const form = openSheet(
     `
     <h2>Plan settings</h2>
-    <label class="field"><span>Name</span><input name="title" required maxlength="120" value="${esc(title)}"></label>
-    <label class="field"><span>Currency</span>
-      <select name="currency">${options.map((c) => `<option ${c === currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+    <div class="row">
+      <label class="field grow"><span>Name</span><input name="title" required maxlength="120" value="${esc(title)}"></label>
+      <label class="field"><span>Currency</span>
+        <select name="currency">${options.map((c) => `<option ${c === currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+    </div>
+    <div class="field"><span>Tags</span>
+      <p class="hint">“Income” tags count prices as money coming in (like selling). Changes save right away.</p>
+      <div class="tag-rows">${tagRows()}</div>
+      <div class="input-row">
+        <input class="new-tag-name" maxlength="40" placeholder="New tag, e.g. Kitchen" enterkeyhint="done">
+        <button type="button" class="btn small" data-action="add-tag">Add</button>
+      </div>
+    </div>
     ${sheetActions('')}`,
-    (data) => mutate('', 'PATCH', data),
+    (data) => mutate('', 'PATCH', { title: data.title, currency: data.currency }),
   );
+
+  const refreshRows = () => (form.querySelector('.tag-rows').innerHTML = tagRows());
+  form.addEventListener('change', async (e) => {
+    const id = e.target.dataset.tag;
+    if (!id) return;
+    if (e.target.classList.contains('tag-name')) {
+      if (!(await mutate(`/tags/${id}`, 'PATCH', { name: e.target.value }))) refreshRows();
+    }
+    if (e.target.classList.contains('tag-money')) await mutate(`/tags/${id}`, 'PATCH', { money: e.target.value });
+  });
+  form.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (e.target.classList.contains('new-tag-name')) {
+      e.preventDefault();
+      actions['add-tag'](e.target);
+    } else if (e.target.classList.contains('tag-name')) {
+      e.preventDefault();
+      e.target.blur();
+    }
+  });
+  form.refreshRows = refreshRows;
 }
 
 // ---- click handling -------------------------------------------------------
@@ -634,6 +800,26 @@ const actions = {
     mutate(`/items/${item.id}`, 'PATCH', { chosenId });
   },
   'fetch-preview': (el) => fetchPreviewInto(el.closest('form'), true),
+  'add-tag': async (el) => {
+    const form = el.closest('form');
+    const input = form.querySelector('.new-tag-name');
+    if (!input.value.trim()) return;
+    if (await mutate('/tags', 'POST', { name: input.value })) {
+      input.value = '';
+      form.refreshRows();
+    }
+  },
+  'delete-tag': async (el) => {
+    const tag = tagById(el.dataset.tag);
+    const used = state.list.items.filter((i) => i.tags.includes(tag.id)).length;
+    if (!confirm(`Delete the tag “${tag.name}”?${used ? ` It is removed from ${used} item(s); the items stay.` : ''}`)) return;
+    if (await mutate(`/tags/${tag.id}`, 'DELETE')) el.closest('form').refreshRows();
+  },
+  'cycle-color': async (el) => {
+    const tag = tagById(el.dataset.tag);
+    const color = TAG_COLORS[(TAG_COLORS.indexOf(colorOf(tag)) + 1) % TAG_COLORS.length];
+    if (await mutate(`/tags/${tag.id}`, 'PATCH', { color })) el.dataset.color = color;
+  },
   filter: (el) => {
     state.filter = el.dataset.value;
     renderList();
@@ -651,7 +837,7 @@ const actions = {
       await navigator.clipboard.writeText(el.dataset.value);
       toast('Link copied');
     } catch {
-      toast('Couldn’t copy. Select the link and copy it manually.', true);
+      toast('Couldn’t copy. Select the link and copy it manually.', { error: true });
     }
   },
   'native-share': (el) => navigator.share({ title: state.list.title, url: el.dataset.value }).catch(() => {}),
@@ -687,6 +873,13 @@ document.addEventListener(
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.list) refresh();
 });
+
+const ICON_SHARE =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 8l5-5 5 5M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>';
+const ICON_GEAR =
+  '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
+const ICON_CHECK =
+  '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>';
 
 // ---- start ----------------------------------------------------------------
 
