@@ -1,0 +1,15 @@
+{
+  "name": "plantogether",
+  "version": "1.0.0",
+  "description": "Shareable, collaborative moving planner: dated todos, product links with prices, and pick-one choices that add up to a budget.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  }
+}

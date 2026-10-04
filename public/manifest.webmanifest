@@ -1,0 +1,10 @@
+{
+  "name": "PlanTogether",
+  "short_name": "PlanTogether",
+  "description": "Plan a move together: dated todos, purchases and choices.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f4ef",
+  "theme_color": "#2f6f5e",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
