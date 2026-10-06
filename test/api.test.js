@@ -208,3 +208,64 @@ test('health check', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.data.ok, true);
 });
+
+test('apartment layout: save, validate, permissions, floor plan image', async () => {
+  const { list, editKey: key } = (await call('POST', '/api/lists', { body: { title: 'Layout' } })).data;
+  const id = list.id;
+  assert.deepEqual(list.layout, { height: 2.5, walls: [], openings: [], rooms: [], background: null });
+
+  const layout = {
+    height: 2.6,
+    walls: [{ id: 'w1', a: [0, 0], b: [4, 0], t: 0.12 }, { id: 'w2', a: [4, 0], b: [4, 3], t: 0.12 }],
+    openings: [{ id: 'd1', wall: 'w1', kind: 'door', at: 1, w: 0.9, h: 2.1, sill: 0 }],
+    rooms: [{ id: 'r1', name: 'Kitchen', points: [[0, 0], [4, 0], [4, 3], [0, 3]] }],
+  };
+  assert.equal((await call('PUT', `/api/lists/${id}/layout`, { body: layout })).status, 403);
+  let r = await call('PUT', `/api/lists/${id}/layout`, { key, body: layout });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.list.layout.walls.length, 2);
+  assert.equal(r.data.list.layout.height, 2.6);
+  assert.equal((await call('GET', `/api/lists/${id}`)).data.list.layout.rooms[0].name, 'Kitchen');
+
+  r = await call('PUT', `/api/lists/${id}/layout`, { key, body: { walls: [{ id: 'x', a: [0, 0], b: ['a', 0] }] } });
+  assert.equal(r.status, 400);
+  assert.match(r.data.error, /number/);
+
+  // Image upload: checked by content, not by the header.
+  const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+  const put = (body, query = '') =>
+    fetch(`${base}/api/lists/${id}/layout/image${query}`, { method: 'PUT', headers: { 'x-edit-key': key, 'content-type': 'image/png' }, body });
+  assert.equal((await put(Buffer.from('<svg onload=alert(1)>'))).status, 415);
+  assert.equal((await fetch(`${base}/api/lists/${id}/layout/image`, { method: 'PUT', body: png })).status, 403);
+  const uploaded = await put(png, '?x=1&y=2&scale=0.02');
+  assert.equal(uploaded.status, 200);
+  const bg = (await uploaded.json()).list.layout.background;
+  assert.deepEqual({ ...bg, v: 0 }, { v: 0, x: 1, y: 2, scale: 0.02, opacity: 0.5 });
+  assert.ok(bg.v > 0);
+
+  const img = await fetch(`${base}/api/lists/${id}/layout/image?v=${bg.v}`);
+  assert.equal(img.status, 200);
+  assert.equal(img.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await img.arrayBuffer()), png);
+
+  // Saving the layout can move the image but never invent or drop it.
+  r = await call('PUT', `/api/lists/${id}/layout`, { key, body: { ...layout, background: { x: 5, y: 5, scale: 0.03, opacity: 0.8, v: 1 } } });
+  assert.deepEqual(r.data.list.layout.background, { v: bg.v, x: 5, y: 5, scale: 0.03, opacity: 0.8 });
+  r = await call('PUT', `/api/lists/${id}/layout`, { key, body: { ...layout, background: null } });
+  assert.equal(r.data.list.layout.background.v, bg.v);
+
+  r = await call('DELETE', `/api/lists/${id}/layout/image`, { key });
+  assert.equal(r.data.list.layout.background, null);
+  assert.equal((await fetch(`${base}/api/lists/${id}/layout/image?v=${bg.v}`)).status, 404);
+  assert.equal(r.data.list.layout.walls.length, 2, 'walls stay when the image goes');
+});
+
+test('vendored libraries are served gzipped and cached for good', async () => {
+  const res = await fetch(`${base}/vendor/three-0.170.0/addons/OrbitControls.js`, { headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-encoding'), 'gzip');
+  assert.match(res.headers.get('cache-control'), /immutable/);
+  assert.match(await res.text(), /class OrbitControls/);
+  const page = await fetch(`${base}/l/abcdefgh12/apartment`);
+  assert.match(await page.text(), /importmap/);
+});

@@ -9,6 +9,11 @@ A shareable, collaborative planner for a move (or anything with dates and a budg
 - **Choices**: add 2+ links to one item (say, 4 sofas) and it becomes a pick-one. Only the chosen option counts toward the total, and undecided choices show a min–max range.
 - **Totals**: what you'll spend, what sales bring in, and the net cost.
 - **Sharing**: every plan has an **edit link** and a **view-only link**. Anyone with the edit link can change the plan, and changes show up live on everyone's screen.
+- **🏠 Apartment layout in 3D**: the **Apartment** tab holds a floor plan of the new place, shared and live like everything else. Switch between **Plan** (2D editor) and **3D** (orbit around it, or *Cut walls* to look inside).
+  - **From a picture**: drop, paste or upload a floor plan image. Measure the scale by tapping both ends of a wall you know the length of, then let ✨ *Find walls* trace the thick dark lines (straight horizontal/vertical walls), or trace them yourself on top of the image.
+  - **From measurements**: *Size* adds a room by width × length with walls around it; it lands next to what's there and snaps into place when dragged. Type exact wall lengths, thicknesses and door/window sizes in the panel.
+  - **By hand**: draw walls corner by corner, or tap out a room's corners. Ends snap to corners, walls, whole centimetres and 45° angles (hold Alt to turn snapping off). Corners that touch stay joined when you drag. Doors (with swing direction) and windows sit in walls. Undo/redo with ⌘Z / Ctrl+Z.
+  - Rooms get a name and show their floor area. Furniture is next.
 - **Mobile first**: works in any phone browser. Use "Add to Home Screen" to open it like an app.
 
 ## Stack
@@ -23,6 +28,8 @@ As small as it gets: **Node.js (≥ 20) with zero npm dependencies**.
 | `lib/classify.js` | Smart quick add: Jev decision model, or keyword rules as fallback |
 | `public/` | Plain HTML/CSS/JS frontend, no build step |
 | `public/shared.js` | Price parsing and totals, shared by browser and server |
+| `public/apartment/` | Apartment tab: layout model + validation (`model.js`, shared with the server), 2D editor (`editor2d.js`), 3D view (`view3d.js`), wall detection from images (`detect.js`), page UI (`page.js`) |
+| `public/vendor/` | [three.js](https://threejs.org) 0.170 (MIT), checked in so there is still nothing to install. Loaded only when you open 3D. |
 
 ## Run it
 
@@ -60,4 +67,4 @@ Settings: `PORT` (default `3000`), `DATA_DIR` (default `./data`), plus the Jev v
 
 ## How access works
 
-There are no accounts. A plan's ID is random and unguessable, so the link alone grants **view** access. The **edit key** lives in the link's `#key=…` part. The `#` part is never sent in normal requests or logged, and the browser sends the key only as a header on API calls. Don't post the edit link publicly. Back up the `data/` folder if a plan matters to you.
+There are no accounts. A plan's ID is random and unguessable, so the link alone grants **view** access. The **edit key** lives in the link's `#key=…` part. The `#` part is never sent in normal requests or logged, and the browser sends the key only as a header on API calls. Don't post the edit link publicly. Back up the `data/` folder if a plan matters to you (a floor plan image is stored next to its plan as `<id>.plan-image`).

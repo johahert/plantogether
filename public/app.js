@@ -34,6 +34,8 @@ const state = {
   hideDone: local.get(HIDE_DONE, false),
   events: null,
   quickBusy: false,
+  view: 'plan', // 'plan' | 'apartment'
+  apartment: null, // the mounted apartment editor, while that tab is open
 };
 
 // ---- helpers --------------------------------------------------------------
@@ -242,7 +244,70 @@ function matchesFilter(item) {
   return item.tags.includes(state.filter);
 }
 
+function headerHtml() {
+  const { list, canEdit, view } = state;
+  const tab = (value, label) =>
+    `<a href="${viewPath(value)}" data-action="view" data-value="${value}" ${view === value ? 'aria-current="page"' : ''}>${label}</a>`;
+  return `
+    <header class="top"><div class="wrap">
+      <a class="icon-btn back" href="/" aria-label="All plans">‹</a>
+      <h1>${esc(list.title)}</h1>
+      <button class="icon-btn" data-action="share" aria-label="Share">${ICON_SHARE}</button>
+      ${canEdit ? `<button class="icon-btn" data-action="settings" aria-label="Plan settings and tags">${ICON_GEAR}</button>` : ''}
+    </div>
+    <nav class="wrap tabs" aria-label="Sections">${tab('plan', 'Plan')}${tab('apartment', 'Apartment')}</nav>
+    ${canEdit ? '' : '<div class="readonly-banner">View only. Ask for the edit link to make changes.</div>'}
+    </header>`;
+}
+
+const viewPath = (view) => `/l/${state.list.id}${view === 'apartment' ? '/apartment' : ''}${location.hash}`;
+
+function setView(view) {
+  if (view === state.view) return;
+  history.pushState(null, '', viewPath(view));
+  state.view = view;
+  renderList();
+  scrollTo(0, 0);
+}
+
+function renderApartment() {
+  const { list, canEdit } = state;
+  document.title = `${list.title} · Apartment · PlanTogether`;
+  document.body.classList.remove('has-composer');
+  if (state.apartment) {
+    app.querySelector('.top h1').textContent = list.title;
+    state.apartment.update(list, canEdit);
+    return;
+  }
+  app.innerHTML = `${headerHtml()}<div id="apt-root"><p class="loading">Loading…</p></div>`;
+  const mounting = {}; // placeholder so a second render doesn't mount twice
+  state.apartment = { update() {}, destroy() { mounting.cancelled = true; } };
+  import('./apartment/page.js')
+    .then(({ mountApartment }) => {
+      if (mounting.cancelled) return;
+      state.apartment = mountApartment(document.getElementById('apt-root'), {
+        list: state.list,
+        canEdit: state.canEdit,
+        esc,
+        toast,
+        api,
+        key: () => state.key,
+        applyList,
+        openSheet,
+        closeSheet: () => sheet.close(),
+        sheetOpen: () => sheet.open,
+      });
+    })
+    .catch((err) => {
+      state.apartment = null;
+      toast(`Couldn’t load the apartment editor (${err.message})`, { error: true });
+    });
+}
+
 function renderList() {
+  if (state.view === 'apartment') return renderApartment();
+  state.apartment?.destroy();
+  state.apartment = null;
   const { list, canEdit } = state;
   document.title = `${list.title} · PlanTogether`;
   document.body.classList.toggle('has-composer', canEdit);
@@ -260,13 +325,7 @@ function renderList() {
     `<button class="chip" data-action="filter" data-value="${value}" aria-pressed="${pressed}" ${extra}>${label}</button>`;
 
   app.innerHTML = `
-    <header class="top"><div class="wrap">
-      <a class="icon-btn back" href="/" aria-label="All plans">‹</a>
-      <h1>${esc(list.title)}</h1>
-      <button class="icon-btn" data-action="share" aria-label="Share">${ICON_SHARE}</button>
-      ${canEdit ? `<button class="icon-btn" data-action="settings" aria-label="Plan settings and tags">${ICON_GEAR}</button>` : ''}
-    </div></header>
-    ${canEdit ? '' : '<div class="readonly-banner">View only. Ask for the edit link to make changes.</div>'}
+    ${headerHtml()}
     <main class="wrap">
       <section class="summary">
         <div class="stats">
@@ -829,6 +888,7 @@ const actions = {
     local.set(HIDE_DONE, state.hideDone);
     renderList();
   },
+  view: (el) => setView(el.dataset.value),
   share: () => openShare(),
   settings: () => openSettings(),
   'close-sheet': () => sheet.close(),
@@ -883,6 +943,15 @@ const ICON_CHECK =
 
 // ---- start ----------------------------------------------------------------
 
+const viewFromPath = () => (/^\/l\/[^/]+\/apartment\/?$/.test(location.pathname) ? 'apartment' : 'plan');
+
+window.addEventListener('popstate', () => {
+  if (!state.list) return;
+  state.view = viewFromPath();
+  renderList();
+});
+
 const match = location.pathname.match(/^\/l\/([A-Za-z0-9_-]+)/);
+state.view = viewFromPath();
 if (match) openList(match[1]);
 else renderHome();

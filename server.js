@@ -2,6 +2,7 @@
 // No dependencies, just Node.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,11 +10,26 @@ import { Store, newId } from './lib/store.js';
 import { fetchPreview } from './lib/preview.js';
 import { classify, jevConfig, splitQuickText } from './lib/classify.js';
 import { DEFAULT_TAGS, TAG_COLORS, nextTagColor, parsePrice } from './public/shared.js';
+import { LayoutError, emptyLayout, sanitizeLayout } from './public/apartment/model.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const MAX_ITEMS = 1000;
 const MAX_OPTIONS = 30;
 const MAX_TAGS = 50;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+// Floor plan images: identified by their first bytes, not the client's word.
+const IMAGE_TYPES = [
+  { type: 'image/png', magic: [0x89, 0x50, 0x4e, 0x47] },
+  { type: 'image/jpeg', magic: [0xff, 0xd8, 0xff] },
+  { type: 'image/webp', magic: [0x52, 0x49, 0x46, 0x46], at8: 'WEBP' },
+  { type: 'image/gif', magic: [0x47, 0x49, 0x46, 0x38] },
+];
+
+function imageType(buf) {
+  const found = IMAGE_TYPES.find((t) => t.magic.every((b, i) => buf[i] === b) && (!t.at8 || buf.toString('latin1', 8, 12) === t.at8));
+  return found?.type ?? null;
+}
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -88,6 +104,15 @@ function applyOptionFields(target, body, creating) {
   if (!target.url && !target.title) throw new HttpError(400, 'Add a link or a name');
 }
 
+function checkedLayout(input, background) {
+  try {
+    return sanitizeLayout(input, { background });
+  } catch (err) {
+    if (err instanceof LayoutError) throw new HttpError(400, err.message);
+    throw err;
+  }
+}
+
 // ---- tags -------------------------------------------------------------------
 
 function findTagByName(list, name) {
@@ -144,17 +169,22 @@ function send(res, status, body) {
   res.end(data);
 }
 
-async function readJson(req) {
+async function readBody(req, limit) {
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 64 * 1024) throw new HttpError(413, 'Request too large');
+    if (size > limit) throw new HttpError(413, 'Request too large');
     chunks.push(chunk);
   }
-  if (!size) return {};
+  return Buffer.concat(chunks);
+}
+
+async function readJson(req, limit = 64 * 1024) {
+  const raw = await readBody(req, limit);
+  if (!raw.length) return {};
   try {
-    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const body = JSON.parse(raw.toString('utf8'));
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error();
     return body;
   } catch {
@@ -168,7 +198,7 @@ function hasEditKey(list, req) {
   return given.length === real.length && timingSafeEqual(given, real);
 }
 
-const publicList = ({ editKey, ...list }) => list;
+const publicList = ({ editKey, ...list }) => ({ ...list, layout: list.layout ?? emptyLayout() });
 
 const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -192,6 +222,7 @@ export function createServer({
 } = {}) {
   const store = new Store(dataDir, migrateList);
   const listeners = new Map(); // listId -> Set<res>
+  const vendorCache = new Map(); // file -> { raw, gzip }
 
   function broadcast(list) {
     for (const res of listeners.get(list.id) ?? []) {
@@ -322,6 +353,53 @@ export function createServer({
       throw new HttpError(405, 'Method not allowed');
     }
 
+    if (sub === 'layout') {
+      // itemId is 'image' for /layout/image
+      if (itemId === 'image') {
+        if (method === 'GET') {
+          const list = await loadList(id);
+          const data = list.layout?.background && (await store.readBlob(id, 'plan-image'));
+          if (!data) throw new HttpError(404, 'No floor plan image');
+          res.writeHead(200, {
+            'content-type': imageType(data) || 'application/octet-stream',
+            'cache-control': 'private, max-age=31536000, immutable', // the URL carries ?v=
+            'x-content-type-options': 'nosniff',
+          });
+          return res.end(data);
+        }
+        const list = await editableList(id, req);
+        const layout = list.layout ?? emptyLayout();
+        if (method === 'PUT') {
+          const data = await readBody(req, MAX_IMAGE_BYTES);
+          if (!imageType(data)) throw new HttpError(415, 'Use a PNG, JPEG, WebP or GIF image');
+          const old = layout.background;
+          const param = (name, fallback) => (url.searchParams.has(name) ? Number(url.searchParams.get(name)) : fallback);
+          const next = checkedLayout({ ...layout, background: null }, {
+            v: Date.now(), // also the image URL's cache buster
+            x: param('x', 0),
+            y: param('y', 0),
+            scale: param('scale', old?.scale ?? 0.01),
+            opacity: old?.opacity ?? 0.5,
+          });
+          await store.writeBlob(id, 'plan-image', data);
+          list.layout = next;
+          return saved(res, list);
+        }
+        if (method === 'DELETE') {
+          await store.deleteBlob(id, 'plan-image');
+          layout.background = null;
+          list.layout = layout;
+          return saved(res, list);
+        }
+        throw new HttpError(405, 'Method not allowed');
+      }
+      if (itemId || method !== 'PUT') throw new HttpError(405, 'Method not allowed');
+      const list = await editableList(id, req);
+      const body = await readJson(req, 1024 * 1024);
+      list.layout = checkedLayout(body, list.layout?.background ?? null);
+      return saved(res, list);
+    }
+
     if (sub === 'quick') {
       if (method !== 'POST') throw new HttpError(405, 'Method not allowed');
       const list = await editableList(id, req);
@@ -420,19 +498,29 @@ export function createServer({
     if (rel === '/' || rel.startsWith('/l/')) rel = '/index.html';
     const file = path.join(publicDir, path.normalize(rel));
     if (!file.startsWith(publicDir + path.sep)) throw new HttpError(404, 'Not found');
-    let data;
-    try {
-      data = await readFile(file);
-    } catch {
-      throw new HttpError(404, 'Not found');
+    // Vendored libraries have their version in the path, so they never change.
+    const immutable = rel.startsWith('/vendor/');
+    let data = immutable ? vendorCache.get(file) : null;
+    if (!data) {
+      try {
+        data = { raw: await readFile(file) };
+      } catch {
+        throw new HttpError(404, 'Not found');
+      }
+      if (immutable) {
+        data.gzip = gzipSync(data.raw);
+        vendorCache.set(file, data);
+      }
     }
+    const gzip = data.gzip && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
     res.writeHead(200, {
       'content-type': MIME[path.extname(file)] || 'application/octet-stream',
-      'cache-control': 'no-cache',
+      'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
       'referrer-policy': 'no-referrer',
       'x-content-type-options': 'nosniff',
+      ...(gzip ? { 'content-encoding': 'gzip', vary: 'accept-encoding' } : {}),
     });
-    res.end(req.method === 'HEAD' ? undefined : data);
+    res.end(req.method === 'HEAD' ? undefined : gzip ? data.gzip : data.raw);
   }
 
   const server = http.createServer(async (req, res) => {
